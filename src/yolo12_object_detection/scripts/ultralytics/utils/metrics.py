@@ -1936,3 +1936,48 @@ class OBBMetrics(SimpleClass):
     def curves_results(self):
         """Returns a list of curves for accessing specific metrics curves."""
         return []
+    
+    #新增
+
+def focal_eiou_loss(box1, box2, xywh=False, gamma=0.5, eps=1e-7):
+    """Focal-EIoU loss for bounding box regression."""
+    if xywh:
+        x1, y1, w1, h1 = box1.unbind(-1)
+        x2, y2, w2, h2 = box2.unbind(-1)
+        b1_x1 = x1 - w1 / 2
+        b1_y1 = y1 - h1 / 2
+        b1_x2 = x1 + w1 / 2
+        b1_y2 = y1 + h1 / 2
+        b2_x1 = x2 - w2 / 2
+        b2_y1 = y2 - h2 / 2
+        b2_x2 = x2 + w2 / 2
+        b2_y2 = y2 + h2 / 2
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.unbind(-1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.unbind(-1)
+
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+
+    w1 = b1_x2 - b1_x1
+    h1 = b1_y2 - b1_y1
+    w2 = b2_x2 - b2_x1
+    h2 = b2_y2 - b2_y1
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+    rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
+            (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4
+    rho_w2 = (w2 - w1) ** 2
+    rho_h2 = (h2 - h1) ** 2
+    cw2 = cw ** 2 + eps
+    ch2 = ch ** 2 + eps
+
+    eiou = iou - rho2 / c2 - rho_w2 / cw2 - rho_h2 / ch2
+    loss_eiou = 1 - eiou
+    focal_weight = (1 - iou) ** gamma
+    loss = focal_weight * loss_eiou
+    return loss

@@ -8,7 +8,7 @@ from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.atss import ATSSAssigner, generate_anchors
-from .metrics import bbox_iou, probiou, bbox_mpdiou, bbox_inner_iou, bbox_focaler_iou, bbox_inner_mpdiou, bbox_focaler_mpdiou, wasserstein_loss, gcd_loss, WiseIouLoss
+from .metrics import bbox_iou, probiou, bbox_mpdiou, bbox_inner_iou, bbox_focaler_iou, bbox_inner_mpdiou, bbox_focaler_mpdiou, wasserstein_loss, gcd_loss, WiseIouLoss,focal_eiou_loss
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
@@ -227,6 +227,7 @@ class BboxLoss(nn.Module):
         self.gcd_loss = False
         self.iou_ratio = 0.5 # total_iou_loss = self.iou_ratio * iou_loss + (1 - self.iou_ratio) * (nwd_loss or gcd_loss)
         
+        self.use_focal_eiou = True   # 新增：启用 Focal-EIoU
         # WiseIOU
         self.use_wiseiou = False
         if self.use_wiseiou:
@@ -241,14 +242,17 @@ class BboxLoss(nn.Module):
             # wiou = self.wiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], ret_iou=False, ratio=0.7, d=0.0, u=0.95, **{'mpdiou_hw':mpdiou_hw[fg_mask]}).unsqueeze(-1) # Wise-MPDIoU,Wise-Inner-MPDIoU,Wise-Focaler-MPDIoU
             loss_iou = (wiou * weight).sum() / target_scores_sum
         else:
-            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            if self.use_focal_eiou:
+                iou_loss = focal_eiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, gamma=0.5)
             # iou = bbox_inner_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True, ratio=0.7)
             # iou = bbox_mpdiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, mpdiou_hw=mpdiou_hw[fg_mask])
             # iou = bbox_inner_mpdiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, mpdiou_hw=mpdiou_hw[fg_mask], ratio=0.7)
             # iou = bbox_focaler_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True, d=0.0, u=0.95)
             # iou = bbox_focaler_mpdiou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, mpdiou_hw=mpdiou_hw[fg_mask], d=0.0, u=0.95)
-            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-                
+            loss_iou = (iou_loss * weight).sum() / target_scores_sum
+            else:
+                iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+                loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum   
         if self.nwd_loss:
             nwd = wasserstein_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
             nwd_loss = ((1.0 - nwd) * weight).sum() / target_scores_sum
