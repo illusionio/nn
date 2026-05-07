@@ -1,12 +1,13 @@
 # detection_engine.py
 # 功能：封装 YOLOv8 模型的加载与推理逻辑，提供干净的检测接口
-# 修改：增加距离估计和危险等级显示
+# 修改：增加距离估计和危险等级显示，增加目标跟踪（分配稳定 ID）
 
 from ultralytics import YOLO
 import io
 import sys
 import os
-import cv2  # 新增导入
+import cv2
+import numpy as np   # 新增导入，用于数据处理
 
 
 class ModelLoadError(Exception):
@@ -34,6 +35,8 @@ class DetectionEngine:
         self.conf_threshold = conf_threshold
         # 加载 YOLO 模型（在初始化时完成，避免每次检测重复加载）
         self.model = self._load_model()
+        self.tracker = None          # 懒加载，第一次调用 detect 时创建
+        self.enable_tracking = True  # 可通过配置控制是否启用跟踪
 
     def _load_model(self):
         """
@@ -118,23 +121,48 @@ class DetectionEngine:
             results = self.model(frame, conf=self.conf_threshold, verbose=False)
             annotated_frame = results[0].plot()   # 获取 YOLO 默认标注图
 
-            # ---------- 新增：添加距离估计和危险等级 ----------
+            # ---------- 新增：距离估计、危险等级 + 目标跟踪 ----------
             if results[0].boxes is not None:
-                boxes = results[0].boxes
-                for box in boxes:
-                    # 获取坐标 (x1, y1, x2, y2)
+                raw_boxes = results[0].boxes
+                
+                # 提取原始检测数据（用于跟踪器）
+                boxes_xyxy = raw_boxes.xyxy.cpu().numpy()   # (N, 4)
+                confs = raw_boxes.conf.cpu().numpy()        # (N,)
+                clses = raw_boxes.cls.cpu().numpy()         # (N,)
+                
+                # 构建检测列表 [(x1,y1,x2,y2,conf,cls), ...]
+                detections = []
+                for i in range(len(boxes_xyxy)):
+                    x1, y1, x2, y2 = boxes_xyxy[i]
+                    detections.append((x1, y1, x2, y2, confs[i], int(clses[i])))
+                
+                # 跟踪器更新，获得带 ID 的检测列表（每个元素多一个 id）
+                if self.enable_tracking:
+                    if self.tracker is None:
+                        self.tracker = SimpleTracker()
+                    tracked_dets = self.tracker.update(detections)   # (x1,y1,x2,y2,conf,cls,id)
+                else:
+                    tracked_dets = [d + (None,) for d in detections]  # 无 ID
+                
+                # --- 原有距离估计和危险等级绘制（保持不变）---
+                for box in raw_boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    # 计算框高度
                     box_height = y2 - y1
-                    # 估算距离
                     distance = self._estimate_distance(box_height)
-                    # 判定危险等级
                     danger = self._get_danger_level(distance)
-                    # 准备显示的文字
                     info_text = f"{danger} {distance:.1f}m"
-                    # 在框的上方绘制文字（y1-15 偏移避免与原始标签重叠）
                     cv2.putText(annotated_frame, info_text, (x1, y1 - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                # --- 新增：在图上绘制跟踪 ID（叠加在 YOLO 默认标注上）---
+                for det in tracked_dets:
+                    x1, y1, x2, y2, conf, cls, obj_id = det
+                    x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                    if obj_id is not None:
+                        id_text = f"ID:{obj_id}"
+                        # 放在距离文字上方（y1 - 25 避免重叠）
+                        cv2.putText(annotated_frame, id_text, (x1, y1 - 25),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             # -------------------------------------------------
 
             return annotated_frame, results
@@ -147,3 +175,113 @@ class DetectionEngine:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
 
+
+class SimpleTracker:
+    """基于 IoU 匹配的简易目标跟踪器，为连续帧中检测到的物体分配稳定 ID。"""
+    
+    def __init__(self, iou_threshold=0.3, max_lost=5):
+        """
+        参数：
+            iou_threshold: 判断是否为同一目标的最小 IoU
+            max_lost: 目标消失多少帧后删除轨迹
+        """
+        self.iou_threshold = iou_threshold
+        self.max_lost = max_lost
+        self.next_id = 1                # 下一个可用的 ID
+        self.tracks = []                # 每个轨迹为 {'id': int, 'box': (x1,y1,x2,y2), 'lost_count': int}
+
+    def update(self, detections):
+        """
+        输入：detections = [(x1, y1, x2, y2, conf, cls), ...]  (list of tuples)
+        输出：带 ID 的检测列表 = [(x1, y1, x2, y2, conf, cls, id), ...]
+        """
+        if not detections:
+            # 没有检测，所有轨迹 lost_count +1
+            for t in self.tracks:
+                t['lost_count'] += 1
+            self._remove_lost_tracks()
+            return []
+
+        # 计算 IoU 矩阵
+        iou_matrix = []
+        for trk in self.tracks:
+            trk_box = trk['box']
+            row = []
+            for det in detections:
+                det_box = det[:4]
+                row.append(self._box_iou(trk_box, det_box))
+            iou_matrix.append(row)
+
+        # 贪心匹配：按 IoU 降序分配
+        matched_track_idx = []
+        matched_det_idx = []
+        used_track = set()
+        used_det = set()
+
+        # 生成所有 (track_idx, det_idx) 对并按 IoU 排序
+        pairs = [(i, j) for i in range(len(self.tracks)) for j in range(len(detections))]
+        pairs.sort(key=lambda x: iou_matrix[x[0]][x[1]], reverse=True)
+
+        for track_idx, det_idx in pairs:
+            if track_idx in used_track or det_idx in used_det:
+                continue
+            if iou_matrix[track_idx][det_idx] >= self.iou_threshold:
+                matched_track_idx.append(track_idx)
+                matched_det_idx.append(det_idx)
+                used_track.add(track_idx)
+                used_det.add(det_idx)
+
+        # 更新匹配到的轨迹
+        for trk_idx, det_idx in zip(matched_track_idx, matched_det_idx):
+            self.tracks[trk_idx]['box'] = detections[det_idx][:4]   # 更新位置
+            self.tracks[trk_idx]['lost_count'] = 0
+
+        # 未匹配的检测 → 新轨迹
+        for j, det in enumerate(detections):
+            if j not in used_det:
+                self.tracks.append({
+                    'id': self.next_id,
+                    'box': det[:4],
+                    'lost_count': 0
+                })
+                self.next_id += 1
+
+        # 未匹配的轨迹 lost_count +1
+        for i, trk in enumerate(self.tracks):
+            if i not in used_track:
+                trk['lost_count'] += 1
+
+        # 移除超期轨迹
+        self._remove_lost_tracks()
+
+        # 组装输出：每个检测（包含新匹配的和新创建的）都带上对应的 ID
+        output = []
+        # 先处理匹配上的（保证 ID 正确）
+        for trk_idx, det_idx in zip(matched_track_idx, matched_det_idx):
+            det = detections[det_idx]
+            trk_id = self.tracks[trk_idx]['id']
+            output.append(det + (trk_id,))
+        # 再处理新轨迹
+        for j, det in enumerate(detections):
+            if j not in used_det:
+                # 新轨迹的 ID 就是最近分配的 next_id-1
+                new_id = self.next_id - 1
+                output.append(det + (new_id,))
+        return output
+
+    def _remove_lost_tracks(self):
+        """删除丢失超过 max_lost 帧的轨迹"""
+        self.tracks = [t for t in self.tracks if t['lost_count'] <= self.max_lost]
+
+    @staticmethod
+    def _box_iou(box1, box2):
+        """计算两个边界框的 IoU，box 格式 (x1, y1, x2, y2)"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - inter
+        return inter / union if union > 0 else 0
