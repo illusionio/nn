@@ -5,6 +5,7 @@ import random
 
 import cv2
 import numpy as np
+import argparse  # 【新增】导入 argparse 模块
 
 # COCO 类别名称
 COCO_CLASS_NAMES = [
@@ -14,6 +15,14 @@ COCO_CLASS_NAMES = [
 from utils.box_utils import draw_bounding_boxes
 from utils.projection import *
 from utils.world import *
+
+# 【新增】===================== 解析命令行参数 =====================
+parser = argparse.ArgumentParser(description="CARLA 2D Detection Ground Truth Generator")
+parser.add_argument('--host', type=str, default='127.0.0.1', help='CARLA server host IP')
+parser.add_argument('--port', type=int, default=2000, help='CARLA server TCP port to listen to')
+parser.add_argument('--num_vehicles', type=int, default=60, help='Number of vehicles to spawn')
+args = parser.parse_args()
+# ================================================================
 
 def camera_callback(image, rgb_image_queue):
     rgb_image_queue.put(np.reshape(np.copy(image.raw_data),
@@ -62,7 +71,7 @@ K = build_projection_matrix(image_w, image_h, fov)
 K_b = build_projection_matrix(image_w, image_h, fov, is_behind_camera=True)
 
 # 随机生成大量交通工具（包含：轿车、巴士、卡车、摩托）
-for i in range(60):
+for i in range(args.num_vehicles):
     vehicle_bp = bp_lib.filter('vehicle')
     npc = world.try_spawn_actor(random.choice(vehicle_bp), random.choice(spawn_points))
     if npc:
