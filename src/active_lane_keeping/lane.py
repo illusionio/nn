@@ -502,7 +502,7 @@ class Lane:
         img, inverse_perspective_transform = self.extract_roi(img)
         _, max_left_idx, max_right_idx = self.get_hist(img)
         left_line, right_line = self.get_line_fits(img.copy(),
-            max_right_idx, max_left_idx)
+            max_left_idx, max_right_idx)
         left_fit_x, right_fit_x, y = self.get_search_window(img.copy(),
             left_line, right_line)
         img, detection_surface_area = self.show_lane(original_image,
